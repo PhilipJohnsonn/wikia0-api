@@ -1,7 +1,15 @@
 package com.scrapi.service;
 
 import java.io.IOException;
-import java.util.*;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -14,174 +22,215 @@ import org.springframework.stereotype.Service;
 @Service
 public class PaginaWebService {
 
-    private static final String URL = "https://manual.imperiumclassic.com/doku.php?id=criaturas&purge=true";
+	private static final String URL = "https://manual.imperiumclassic.com/doku.php?id=criaturas&purge=true";
 
-    public List<Map<String, Object>> scrapear() throws IOException {
-        Document doc = Jsoup.connect(URL)
-                .userAgent("Mozilla/5.0")
-                .timeout(10000)
-                .get();
+	// Rutas relativas en tu carpeta `public/`
+	private static final String CREATURES_WEB_PATH = "/images/criaturas/";
+	private static final String DROPS_WEB_PATH = "/images/drops/";
 
-        Element table = doc.selectFirst("table");
-        List<Element> filas = table.select("tr").subList(1, table.select("tr").size());
+	public List<Map<String, Object>> scrapear() throws IOException {
+		Document doc = Jsoup.connect(URL).userAgent("Mozilla/5.0").timeout(10_000).get();
 
-        List<Map<String, Object>> lista = new ArrayList<>();
+		Element table = doc.selectFirst("table");
+		List<Element> filas = table.select("tr").subList(1, table.select("tr").size());
 
-        for (Element fila : filas) {
-            Elements celdas = fila.select("td");
-            Map<String, Object> criatura = new HashMap<>();
+		List<Map<String, Object>> lista = new ArrayList<>();
 
-            criatura.put("nombre", celdas.get(0).text());
-            criatura.put("imageUrl", celdas.get(1).selectFirst("img").absUrl("src"));
-            criatura.put("hp", parseIntSafe(celdas.get(2).text()));
-            criatura.put("exp", parseIntSafe(celdas.get(3).text()));
-            criatura.put("oro", parseIntSafe(celdas.get(4).text()));
+		for (Element fila : filas) {
+			Elements celdas = fila.select("td");
+			Map<String, Object> criatura = new HashMap<>();
 
-            // RESP
-            String rawRespawn = celdas.get(5).text().toLowerCase().trim();
-            int respawnMin = 0;
-            int respawnMax = 0;
-            String unidad = "";
+			criatura.put("nombre", celdas.get(0).text());
 
-            if (rawRespawn.contains("h")) unidad = "h";
-            else if (rawRespawn.contains("s")) unidad = "s";
-            else if (rawRespawn.contains("m")) unidad = "m";
+			// Construyo URL local de la imagen de criatura
+			String fetchCriUrl = celdas.get(1).selectFirst("img").absUrl("src");
+			String criFile = getFileName(fetchCriUrl);
+			criatura.put("imageUrl", CREATURES_WEB_PATH + criFile);
 
-            String clean = rawRespawn.replaceAll("[^0-9–\\-]+", "");
-            String[] partes = clean.split("–|\\-");
-            if (partes.length > 0) {
-                respawnMin = parseIntSafe(partes[0]);
-                respawnMax = partes.length > 1 ? parseIntSafe(partes[1]) : respawnMin;
-            }
+			criatura.put("hp", parseIntSafe(celdas.get(2).text()));
+			criatura.put("exp", parseIntSafe(celdas.get(3).text()));
+			criatura.put("oro", parseIntSafe(celdas.get(4).text()));
 
-            criatura.put("respawnMin", respawnMin);
-            criatura.put("respawnMax", respawnMax);
-            criatura.put("respawnUnidad", unidad);
+			// Respawn
+			String rawResp = celdas.get(5).text().toLowerCase().trim();
+			String[] maxMinResp = rawResp.split("-");
+			
+			String minRawResp = maxMinResp[0].trim();
+			String maxRawResp = maxMinResp[1].trim();
+			
+			criatura.put("respawnMinSeg", this.parseSegundos(minRawResp));
+			criatura.put("respawnMaxSeg", this.parseSegundos(maxRawResp));
+			criatura.put("respawnMin", minRawResp);
+			criatura.put("respawnMax", maxRawResp);
 
-            // DROPS
-            List<Map<String, String>> drops = new ArrayList<>();
-            for (Element img : celdas.get(6).select("img")) {
-                Map<String, String> drop = new HashMap<>();
-                drop.put("imagenUrl", img.absUrl("src"));
+			// Drops
+			List<Map<String, String>> drops = new ArrayList<>();
+			for (Element img : celdas.get(6).select("img")) {
+				String tooltip = img.hasAttr("title") ? img.attr("title") : img.attr("alt");
 
-                String tooltip = img.hasAttr("title") ? img.attr("title") : img.attr("alt");
-                String nombre = tooltip.trim();
-                String porcentaje = "";
+				// parseo nombre y porcentaje correctamente
+				AbstractMap.SimpleEntry<String, String> parsed = parseNombreYPorcentaje(tooltip);
+				String nombre = parsed.getKey();
+				String porcentaje = parsed.getValue();
 
-                Pattern pattern = Pattern.compile("^(.*?)(\\d+(?:[.,]\\d+)?)(?:\\s?%)?");
-                Matcher matcher = pattern.matcher(tooltip);
+				// URL local del drop
+				String fetchDropUrl = img.absUrl("src");
+				String dropFile = getFileName(fetchDropUrl);
 
-                if (matcher.find()) {
-                    nombre = matcher.group(1).trim();
-                    String raw = matcher.group(2).replaceAll("[^0-9.,]", "").trim();
+				Map<String, String> drop = new HashMap<>();
+				drop.put("imagenUrl", DROPS_WEB_PATH + dropFile);
+				drop.put("nombre", nombre);
+				drop.put("porcentaje", porcentaje);
+				drops.add(drop);
+			}
+			criatura.put("drops", drops);
 
-                    if (!raw.isEmpty()) {
-                        raw = raw.replace(",", ".");
-                        try {
-                            double p = Double.parseDouble(raw);
-                            porcentaje = (p % 1 == 0) ? String.valueOf((int)p) : String.format("%.2f", p).replaceAll("\\.?0+$", "");
-                        } catch (NumberFormatException e) {
-                            porcentaje = raw.replaceAll("[^0-9.]", "");
-                        }
-                    }
-                } else {
-                    // fallback: intentar capturar solo números en el texto
-                    Pattern fallback = Pattern.compile("(\\d+(?:[.,]\\d+)?)");
-                    Matcher m2 = fallback.matcher(tooltip);
-                    if (m2.find()) {
-                        porcentaje = m2.group(1).replace(",", ".").replaceAll("[^0-9.]", "");
-                    }
-                }
+			lista.add(criatura);
+		}
+		return lista;
+	}
 
+	private int parseSegundos(String rawResp) {
+		
+		int segundosTotales = 0;
+		//Primero verifiar si el string tiene un espacio.
+		if(rawResp.contains(" ")) {
+			//Significa que hay que sumar dos valores distintos.
+			String[] partes = rawResp.split(" ");
+			segundosTotales = this.calcularSegundos(partes[0]);
+			segundosTotales += this.calcularSegundos(partes[1]);
+			return segundosTotales;
+		}
+		segundosTotales += this.calcularSegundos(rawResp);
+		return segundosTotales;
+	}
 
-                drop.put("nombre", nombre);
-                drop.put("porcentaje", porcentaje);
-                drops.add(drop);
-            }
+	private int calcularSegundos(String tiempo) {
+		int segundos = 0;
+		if(tiempo.contains("h")) {
+			String cleanTiempo = tiempo.replace("h", "");
+			int tiempoLimpio = Integer.parseInt(cleanTiempo);
+			segundos = tiempoLimpio * 3600;
+		}
+		if(tiempo.contains("m")) {
+			String cleanTiempo = tiempo.replace("m", "");
+			int tiempoLimpio = Integer.parseInt(cleanTiempo);
+			segundos = tiempoLimpio * 60;
+		}
+		if(tiempo.contains("s")) {
+			String cleanTiempo = tiempo.replace("s", "");
+			int tiempoLimpio = Integer.parseInt(cleanTiempo);
+			segundos = tiempoLimpio;
+		}
+		return segundos;
+	}
 
-            criatura.put("drops", drops);
-            lista.add(criatura);
-        }
+	public List<Map<String, Object>> scrapearDropsPorItem() throws IOException {
+		Document doc = Jsoup.connect(URL).userAgent("Mozilla/5.0").timeout(10_000).get();
 
-        return lista;
-    }
+		Element table = doc.selectFirst("table");
+		List<Element> filas = table.select("tr").subList(1, table.select("tr").size());
 
-    private Integer parseIntSafe(String val) {
-        try {
-            return Integer.parseInt(val.trim());
-        } catch (Exception e) {
-            return 0;
-        }
-    }
+		Map<String, Map<String, Object>> dropMap = new HashMap<>();
 
-    public List<Map<String, Object>> scrapearDropsPorItem() throws IOException {
-        Document doc = Jsoup.connect(URL)
-                .userAgent("Mozilla/5.0")
-                .timeout(10000)
-                .get();
+		for (Element fila : filas) {
+			Elements celdas = fila.select("td");
+			String nombreCriatura = celdas.get(0).text();
 
-        Element table = doc.selectFirst("table");
-        List<Element> filas = table.select("tr").subList(1, table.select("tr").size());
+			// URL local de la criatura
+			String fetchCriUrl = celdas.get(1).selectFirst("img").absUrl("src");
+			String criFile = getFileName(fetchCriUrl);
+			String criLocal = CREATURES_WEB_PATH + criFile;
 
-        // Resultado final
-        Map<String, Map<String, Object>> dropMap = new HashMap<>();
+			for (Element img : celdas.get(6).select("img")) {
+				String tooltip = img.hasAttr("title") ? img.attr("title") : img.attr("alt");
 
-        for (Element fila : filas) {
-            Elements celdas = fila.select("td");
+				// parseo nombreDrop y porcentaje
+				AbstractMap.SimpleEntry<String, String> parsed = parseNombreYPorcentaje(tooltip);
+				String nombreDrop = parsed.getKey();
+				String porcentaje = parsed.getValue();
 
-            String nombreCriatura = celdas.get(0).text();
-            String imagenUrlCriatura = celdas.get(1).selectFirst("img").absUrl("src");
+				// URL local del drop
+				String fetchDropUrl = img.absUrl("src");
+				String dropFile = getFileName(fetchDropUrl);
+				String dropLocal = DROPS_WEB_PATH + dropFile;
 
-            for (Element img : celdas.get(6).select("img")) {
-                String tooltip = img.hasAttr("title") ? img.attr("title") : img.attr("alt");
+				// inicializar drop si es primera vez
+				dropMap.computeIfAbsent(nombreDrop, k -> {
+					Map<String, Object> m = new HashMap<>();
+					m.put("drop", nombreDrop);
+					m.put("imagenUrl", dropLocal);
+					m.put("criaturas", new ArrayList<Map<String, String>>());
+					return m;
+				});
 
-                // Inicialización por defecto
-                String nombreDrop = tooltip.trim();
-                String porcentaje = "";
-                String imagenUrlDrop = img.absUrl("src");
+				@SuppressWarnings("unchecked")
+				List<Map<String, String>> criaturas = (List<Map<String, String>>) dropMap.get(nombreDrop)
+						.get("criaturas");
 
-                // Extraer nombre + porcentaje
-                Pattern pattern = Pattern.compile("^(.*?)(\\d+(?:[.,]\\d+)?)(?:\\s?%)?");
-                Matcher matcher = pattern.matcher(tooltip);
+				Map<String, String> entry = new HashMap<>();
+				entry.put("nombre", nombreCriatura);
+				entry.put("imagenUrl", criLocal);
+				entry.put("porcentaje", porcentaje);
+				criaturas.add(entry);
+			}
+		}
 
-                if (matcher.find()) {
-                    nombreDrop = matcher.group(1).trim();
-                    String raw = matcher.group(2).replace(",", ".").replaceAll("[^0-9.]", "").trim();
+		return new ArrayList<>(dropMap.values());
+	}
 
-                    try {
-                        double p = Double.parseDouble(raw);
-                        porcentaje = (p % 1 == 0)
-                            ? String.valueOf((int) p)
-                            : String.format("%.2f", p).replaceAll("\\.?0+$", "");
-                    } catch (Exception e) {
-                        porcentaje = raw;
-                    }
-                }
+	/**
+	 * Extrae nombre y porcentaje (último número antes de '%'), preservando
+	 * modificadores internos como "(RM +20)". Ej: "Gorro Mágico (RM +20) 0.1 %" →
+	 * key="Gorro Mágico (RM +20)", value="0.1"
+	 */
+	private AbstractMap.SimpleEntry<String, String> parseNombreYPorcentaje(String tooltip) {
+		String nombre = tooltip.trim();
+		String porcentaje = "";
 
-                // Si el drop no existe, lo creo
-                if (!dropMap.containsKey(nombreDrop)) {
-                    Map<String, Object> nuevoDrop = new HashMap<>();
-                    nuevoDrop.put("drop", nombreDrop);
-                    nuevoDrop.put("imagenUrl", imagenUrlDrop);
-                    nuevoDrop.put("criaturas", new ArrayList<Map<String, String>>());
-                    dropMap.put(nombreDrop, nuevoDrop);
-                }
+		// regex: todo hasta la última parte no numérica, luego el número final, luego
+		// opcional '%'
+		Pattern pat = Pattern.compile("^(.*\\D)\\s+(\\d+(?:[.,]\\d+)?)\\s*%$");
+		Matcher m = pat.matcher(tooltip);
+		if (m.matches()) {
+			nombre = m.group(1).trim();
+			porcentaje = m.group(2).replace(",", ".");
+		}
+		return new AbstractMap.SimpleEntry<>(nombre, porcentaje);
+	}
 
-                // Agrego la criatura al array de criaturas
-                List<Map<String, String>> criaturas = (List<Map<String, String>>) dropMap.get(nombreDrop).get("criaturas");
-                criaturas.add(Map.of(
-                    "nombre", nombreCriatura,
-                    "imagenUrl", imagenUrlCriatura,
-                    "porcentaje", porcentaje
-                ));
-            }
-        }
+	private String getFileName(String fetchUrl) {
+		try {
+			String realUrl = decodeMediaUrl(fetchUrl);
+			URL u = new URL(realUrl);
+			return Paths.get(u.getPath()).getFileName().toString();
+		} catch (Exception e) {
+			String afterSlash = fetchUrl.substring(fetchUrl.lastIndexOf('/') + 1);
+			return afterSlash.contains("?") ? afterSlash.substring(0, afterSlash.indexOf('?')) : afterSlash;
+		}
+	}
 
-        return new ArrayList<>(dropMap.values());
-    }
+	private String decodeMediaUrl(String fetchUrl) {
+		try {
+			URL u = new URL(fetchUrl);
+			String q = u.getQuery();
+			if (q == null)
+				return fetchUrl;
+			for (String part : q.split("&")) {
+				if (part.startsWith("media=")) {
+					return URLDecoder.decode(part.substring(6), StandardCharsets.UTF_8.name());
+				}
+			}
+		} catch (Exception ignored) {
+		}
+		return fetchUrl;
+	}
 
-
-
-
-
+	private Integer parseIntSafe(String val) {
+		try {
+			return Integer.parseInt(val.trim());
+		} catch (Exception e) {
+			return 0;
+		}
+	}
 }
